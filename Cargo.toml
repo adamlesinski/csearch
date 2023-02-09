@@ -1,0 +1,7 @@
+[package]
+name = "csearch"
+version = "0.1.0"
+authors = [ "Adam Lesinski <adamlesinski@gmail.com>", "Vardhan M <exacube@gmail.com>" ]
+edition = "2021"
+
+[dependencies]
