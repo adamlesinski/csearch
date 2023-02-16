@@ -3,7 +3,7 @@ use clap::Parser;
 use glob::glob;
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::iter::IntoIterator;
+use std::iter::{IntoIterator, Peekable};
 use std::path::PathBuf;
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -38,24 +38,46 @@ pub enum DocSource {
     Mem(String),
 }
 
-fn tokenize(input: &str) -> Result<Vec<String>> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Token {
+    Question,
+    Star,
+    Or,
+    LeftParen,
+    RightParen,
+    Dot,
+    Plus,
+    AlphaNum(String),
+}
+
+fn tokenize(input: &str) -> Result<Vec<Token>> {
     let mut tokens = vec![];
-    let mut token = String::new();
+    let mut alphanum = String::new();
     for ch in input.chars() {
-        if ch == '|' || ch == '?' {
-            if !token.is_empty() {
-                tokens.push(token);
-                token = String::new();
+        let symbol = match ch {
+            '|' => Some(Token::Or),
+            '?' => Some(Token::Question),
+            '(' => Some(Token::LeftParen),
+            ')' => Some(Token::RightParen),
+            '*' => Some(Token::Star),
+            '.' => Some(Token::Dot),
+            '+' => Some(Token::Plus),
+            _ => None,
+        };
+        if let Some(symbol) = symbol {
+            if !alphanum.is_empty() {
+                tokens.push(Token::AlphaNum(alphanum));
+                alphanum = String::new();
             }
-            tokens.push(ch.to_string());
+            tokens.push(symbol);
         } else {
-            token.push(ch);
+            alphanum.push(ch);
         }
     }
-    if !token.is_empty() {
-        tokens.push(token);
+    if !alphanum.is_empty() {
+        tokens.push(Token::AlphaNum(alphanum));
     }
-    return Ok(tokens)
+    return Ok(tokens);
 }
 
 // EXPR = EXPR | EXPR
@@ -63,30 +85,135 @@ fn tokenize(input: &str) -> Result<Vec<String>> {
 #[derive(PartialEq, Eq, Debug)]
 enum Expr {
     ZeroOrOne(Box<Expr>),
+    ZeroOrMore(Box<Expr>),
+    OneOrMore(Box<Expr>),
     And(Box<Expr>, Box<Expr>),
     Or(Box<Expr>, Box<Expr>),
     Text(String),
-    Nil,
+    Dot,
+    Group(Box<Expr>),
 }
 
-fn parse(tokens: &[String]) -> Result<Expr> {
-    // check if its an or expression:
-    Ok(match tokens {
-        // abc?def
-        // a="abc" op="?" tail="def"
-        // => "ab" AND "c?" AND "def"
-        [a, op, tail @ ..] if op == "?" => Expr::And(
-            Box::new(Expr::Text(a.as_str()[0..a.len() - 1].to_string())),
-            Box::new(Expr::And(
-                Box::new(Expr::ZeroOrOne(Box::new(Expr::Text(a.as_str()[a.len() - 1..a.len()].to_string())))),
-                Box::new(parse(tail)?),
-            )),
-        ),
-        [a, op, tail @ ..] if op == "|" => Expr::Or(Box::new(Expr::Text(a.clone())), Box::new(parse(tail)?)),
-        [a] => Expr::Text(a.clone()),
-        [] => Expr::Nil,
-        rest => return Err(anyhow!("unsupported syntax: {:?}", rest)),
+struct TokenStream {
+    iter: Peekable<std::vec::IntoIter<Token>>,
+}
+
+impl TokenStream {
+    fn new(tokens: Vec<Token>) -> Self {
+        Self {
+            iter: tokens.into_iter().peekable(),
+        }
+    }
+
+    fn peek(&mut self) -> Result<&Token> {
+        self.iter.peek().ok_or_else(|| anyhow!("EOF"))
+    }
+
+    fn expect(&mut self, t: Token) -> Result<()> {
+        self.next().and_then(|a| {
+            if a == t {
+                Ok(())
+            } else {
+                Err(anyhow!("expected {:?}, got {:?}", t, a))
+            }
+        })
+    }
+
+    fn next(&mut self) -> Result<Token> {
+        self.iter.next().ok_or_else(|| anyhow!("EOF"))
+    }
+
+    fn has_more(&mut self) -> bool {
+        self.iter.peek().is_some()
+    }
+}
+
+// REGEX:
+//   TERM '|' TERM
+// TERM:
+//   FACTOR*
+// FACTOR:
+//    BASE '?'
+//    BASE '*'
+//    BASE '+'
+// BASE:
+//   char | '(' REGEX ')' | .
+//
+// char: A-Za-z0-9
+
+fn regex(stream: &mut TokenStream) -> Result<Expr> {
+    let left = term(stream)?;
+    Ok(if stream.has_more() && stream.peek()? == &Token::Or {
+        stream.expect(Token::Or)?;
+        let right = regex(stream)?;
+        Expr::Or(Box::new(left), Box::new(right))
+    } else {
+        left
     })
+}
+
+fn term(stream: &mut TokenStream) -> Result<Expr> {
+    let mut expr = factor(stream)?;
+    while stream.has_more() && stream.peek()? != &Token::RightParen && stream.peek()? != &Token::Or
+    {
+        let next = factor(stream)?;
+        expr = Expr::And(Box::new(expr), Box::new(next));
+    }
+    Ok(expr)
+}
+
+//         [Token::AlphaNum(a), Token::Question, tail @ ..] => Expr::And(
+//             Box::new(Expr::Text(a.as_str()[0..a.len() - 1].to_string())),
+//             Box::new(Expr::And(
+//                 Box::new(Expr::ZeroOrOne(Box::new(Expr::Text(
+//                     a.as_str()[a.len() - 1..a.len()].to_string(),
+//                 )))),
+//                 Box::new(parse(tail)?),
+//             )),
+//         ),
+fn factor(stream: &mut TokenStream) -> Result<Expr> {
+    let expr = base(stream)?;
+    if !stream.has_more() {
+        return Ok(expr);
+    }
+
+    let expr_factory = match stream.peek()? {
+        Token::Question => Expr::ZeroOrOne,
+        Token::Star => Expr::ZeroOrMore,
+        Token::Plus => Expr::OneOrMore,
+        _ => return Ok(expr),
+    };
+
+    stream.next()?;
+
+    Ok(if let Expr::Text(text) = &expr {
+        let (prefix, suffix) = text.split_at(text.len() - 1);
+        Expr::And(
+            Box::new(Expr::Text(prefix.to_string())),
+            Box::new(expr_factory(Box::new(Expr::Text(suffix.to_string())))),
+        )
+    } else {
+        expr_factory(Box::new(expr))
+    })
+}
+
+fn base(stream: &mut TokenStream) -> Result<Expr> {
+    if stream.peek()? == &Token::LeftParen {
+        stream.expect(Token::LeftParen)?;
+        let inner = regex(stream)?;
+        stream.expect(Token::RightParen)?;
+        Ok(Expr::Group(Box::new(inner)))
+    } else {
+        match stream.next()? {
+            Token::AlphaNum(text) => Ok(Expr::Text(text)),
+            Token::Dot => Ok(Expr::Dot),
+            t => Err(anyhow!("expected alpha num, got {:?}", t)),
+        }
+    }
+}
+
+fn parse(tokens: &mut TokenStream) -> Result<Expr> {
+    regex(tokens)
 }
 
 impl Index {
@@ -152,7 +279,7 @@ impl Index {
         }
 
         let tokens = tokenize(term)?;
-        let expr = parse(&tokens)?;
+        let expr = parse(&mut TokenStream::new(tokens))?;
         eprintln!("Search expr: {:#?}", &expr);
 
         // AND all trigrams means that each trigram must be present in the index.
@@ -169,6 +296,7 @@ impl Index {
 
     fn eval(&self, expr: Expr) -> HashSet<DocIndex> {
         match expr {
+            Expr::OneOrMore(expr) | Expr::Group(expr) => self.eval(*expr),
             Expr::Text(term) => {
                 let mut doc_set: Option<HashSet<DocIndex>> = None;
                 for trigram in split_into_trigrams(&term) {
@@ -182,15 +310,11 @@ impl Index {
                         return HashSet::new();
                     }
                 }
-                doc_set.unwrap_or_default()
+                doc_set.unwrap_or_else(|| (0..self.doc_sources.len()).collect())
             }
-            Expr::Or(left, right) => {
-                &self.eval(*left) | &self.eval(*right)
-            }
-            Expr::And(left, right) => {
-                &self.eval(*left) & &self.eval(*right)
-            }
-            Expr::Nil | Expr::ZeroOrOne(_) => {
+            Expr::Or(left, right) => &self.eval(*left) | &self.eval(*right),
+            Expr::And(left, right) => &self.eval(*left) & &self.eval(*right),
+            Expr::ZeroOrMore(_) | Expr::ZeroOrOne(_) | Expr::Dot => {
                 (0..self.doc_sources.len()).collect()
             }
         }
@@ -205,7 +329,10 @@ impl Index {
 /// "Go" => ["Go"]
 fn split_into_trigrams<'a>(input: &'a str) -> impl Iterator<Item = &'a str> {
     let start = input.grapheme_indices(true);
-    let end = input.grapheme_indices(true).chain(std::iter::once((input.len(), &input[0..0]))).skip(3);
+    let end = input
+        .grapheme_indices(true)
+        .chain(std::iter::once((input.len(), &input[0..0])))
+        .skip(3);
     let iter = start.zip(end);
     iter.map(|((start, _), (end, _))| &input[start..end])
 }
@@ -380,57 +507,123 @@ mod tests {
         );
 
         assert_eq_unordered!(
-            index
-                .search("Google?")
-                .expect("search failed"),
+            index.search("Google?").expect("search failed"),
             vec![s!("test_data/file1"), s!("test_data/file2")],
         );
         assert_eq_unordered!(
-            index
-                .search("Google ?Search")
-                .expect("search failed"),
+            index.search("Google ?Search").expect("search failed"),
             vec![s!("test_data/file1")],
         );
         assert_eq_unordered!(
-            index
-                .search("Google z?Search")
-                .expect("search failed"),
+            index.search("Google z?Search").expect("search failed"),
             vec![s!("test_data/file1")],
         );
     }
 
     #[test]
     fn tokenize_simple() {
-        assert_eq!(tokenize("abcd").unwrap(), vec![s!("abcd")]);
-        assert_eq!(tokenize("ab|cd").unwrap(), vec![s!("ab"), s!("|"), s!("cd")]);
-        assert_eq!(tokenize("ab|").unwrap(), vec![s!("ab"), s!("|")]);
-        assert_eq!(tokenize("|ab").unwrap(), vec![s!("|"), s!("ab")]);
-        assert_eq!(tokenize("|").unwrap(), vec![s!("|")]);
-        assert_eq!(tokenize("||").unwrap(), vec![s!("|"), s!("|")]);
+        assert_eq!(tokenize("abcd").unwrap(), vec![Token::AlphaNum(s!("abcd"))]);
+        assert_eq!(
+            tokenize("ab|cd").unwrap(),
+            vec![
+                Token::AlphaNum(s!("ab")),
+                Token::Or,
+                Token::AlphaNum(s!("cd"))
+            ]
+        );
+        assert_eq!(
+            tokenize("ab|").unwrap(),
+            vec![Token::AlphaNum(s!("ab")), Token::Or]
+        );
+        assert_eq!(
+            tokenize("|ab").unwrap(),
+            vec![Token::Or, Token::AlphaNum(s!("ab"))]
+        );
+        assert_eq!(tokenize("|").unwrap(), vec![Token::Or]);
+        assert_eq!(tokenize("||").unwrap(), vec![Token::Or, Token::Or]);
     }
 
     fn parse_stuff(input: &str) -> Expr {
         let tokens = tokenize(input).expect("failed to tokenize");
-        parse(&tokens).expect("failed to parse tokens")
+        parse(&mut TokenStream::new(tokens)).expect("failed to parse tokens")
     }
 
     #[test]
     fn parse_simple() {
         assert_eq!(parse_stuff("abcd"), Expr::Text(s!("abcd")));
-        assert_eq!(parse_stuff("abc|def|ghi"), Expr::Or(
-            Box::new(Expr::Text(s!("abc"))),
-            Box::new(Expr::Or(
-                Box::new(Expr::Text(s!("def"))),
-                Box::new(Expr::Text(s!("ghi"))),
-            ))
-        ));
-        assert_eq!(parse_stuff("abc?d"), Expr::And(
-            Box::new(Expr::Text(s!("ab"))),
-            Box::new(Expr::And(
-                Box::new(Expr::ZeroOrOne(Box::new(Expr::Text(s!("c"))))),
-                Box::new(Expr::Text(s!("d"))),
-            ))
-        ));
+        assert_eq!(
+            parse_stuff("abc|def|ghi"),
+            Expr::Or(
+                Box::new(Expr::Text(s!("abc"))),
+                Box::new(Expr::Or(
+                    Box::new(Expr::Text(s!("def"))),
+                    Box::new(Expr::Text(s!("ghi"))),
+                ))
+            )
+        );
+        assert_eq!(
+            parse_stuff("abc?d"),
+            Expr::And(
+                Box::new(Expr::And(
+                    Box::new(Expr::Text(s!("ab"))),
+                    Box::new(Expr::ZeroOrOne(Box::new(Expr::Text(s!("c")))))
+                )),
+                Box::new(Expr::Text(s!("d")))
+            )
+        );
+    }
+
+    #[test]
+    fn search_parentheses() {
+        let docs = make_docs(["Google", "Googly"]);
+        let index = Index::new_with_sources(docs);
+
+        assert_eq!(
+            index.search("Goo(abcd)gle").expect("search failed"),
+            Vec::<String>::new()
+        );
+
+        assert_eq!(
+            index.search("Goo(abcd)?gle").expect("search failed"),
+            vec![s!("Google")],
+        );
+    }
+
+    #[test]
+    fn search_one_or_more() {
+        let docs = make_docs(["Google", "Gooooogle", "Fun"]);
+        let index = Index::new_with_sources(docs);
+
+        assert_eq!(
+            index.search("Goo(ooo)+gle").expect("search failed"),
+            vec![s!("Gooooogle")]
+        );
+
+        assert_eq_unordered!(
+            index.search("G(o)+gle").expect("search failed"), // try to match docs with: ANY AND gle
+            vec![s!("Google"), s!("Gooooogle")],
+        );
+
+        assert_eq_unordered!(
+            index.search("Goo+gle").expect("search failed"),
+            vec![s!("Google"), s!("Gooooogle")],
+        );
+    }
+
+    #[test]
+    fn search_dot() {
+        let docs = make_docs(["Google", "Gooooogle", "Fun"]);
+        let index = Index::new_with_sources(docs);
+
+        assert_eq_unordered!(
+            index.search("Goo.gle").expect("search failed"),
+            vec![s!("Google"), s!("Gooooogle")]
+        );
+
+        assert_eq_unordered!(
+            index.search("Go.+gle").expect("search failed"),
+            vec![s!("Google"), s!("Gooooogle")],
+        );
     }
 }
 
@@ -443,7 +636,7 @@ mod tests {
 
 // [Go][o*][gle] = ANY AND match(o*) AND gle
 // match(Go) AND match(o*) AND match(gle)
-// any AND any 
+// any AND any
 
 // match(Go) AND match(o*) AND gle
 //
